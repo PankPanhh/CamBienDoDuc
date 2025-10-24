@@ -1,5 +1,6 @@
 import tkinter as tk
-from tkinter import ttk
+# Import ttkbootstrap as b
+import ttkbootstrap as b
 import serial
 import time
 import os
@@ -7,7 +8,6 @@ import threading
 from datetime import datetime
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import math
 import re
 import sqlite3
 from collections import deque
@@ -20,18 +20,20 @@ try:
 except Exception:
     HAS_CERTIFI = False
 
-# Lớp Cửa sổ Lịch sử (Không thay đổi)
+# Lớp Cửa sổ Lịch sử (Đã nâng cấp lên ttkbootstrap)
 class HistoryWindow(tk.Toplevel):
-    def __init__(self, master=None, colors=None):
+    def __init__(self, master=None):
         super().__init__(master)
         self.title("Lịch sử Đo Độ đục")
         self.geometry("600x400")
-        self.colors = colors or {"bg_main": "#111827", "text": "#D1D5DB"}
-        self.configure(bg=self.colors["bg_main"])
-        frame = ttk.Frame(self, padding=10)
+
+        # Sử dụng b.Frame
+        frame = b.Frame(self, padding=10)
         frame.pack(fill="both", expand=True)
+
         columns = ("timestamp", "voltage", "turbidity", "status")
-        self.tree = ttk.Treeview(frame, columns=columns, show="headings")
+        # Sử dụng b.Treeview
+        self.tree = b.Treeview(frame, columns=columns, show="headings", bootstyle='primary')
         self.tree.heading("timestamp", text="Thời gian")
         self.tree.heading("voltage", text="Điện áp (mV)")
         self.tree.heading("turbidity", text="Độ đục (NTU)")
@@ -40,21 +42,24 @@ class HistoryWindow(tk.Toplevel):
         self.tree.column("voltage", width=100, anchor=tk.CENTER)
         self.tree.column("turbidity", width=100, anchor=tk.CENTER)
         self.tree.column("status", width=120, anchor=tk.W)
-        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
+
+        # Sử dụng b.Scrollbar
+        scrollbar = b.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
-        self.tree.tag_configure('distilled', foreground='#22C55E')
-        self.tree.tag_configure('clear', foreground='#38BDF8')
-        self.tree.tag_configure('slight', foreground='#EAB308')
-        self.tree.tag_configure('cloudy', foreground='#F97316')
-        self.tree.tag_configure('very_cloudy', foreground='#EF4444')
-        button_frame = ttk.Frame(self, padding=(0, 10))
+
+        # Xóa tag_configure, thay bằng bootstyle tags trong load_data
+        
+        button_frame = b.Frame(self, padding=(0, 10))
         button_frame.pack(fill="x")
-        ttk.Button(button_frame, text="Làm mới", command=self.load_data).pack(side="left", padx=10)
-        ttk.Button(button_frame, text="Đóng", command=self.destroy).pack(side="right", padx=10)
+        
+        # Sử dụng b.Button
+        b.Button(button_frame, text="Làm mới", command=self.load_data, bootstyle='primary').pack(side="left", padx=10)
+        b.Button(button_frame, text="Đóng", command=self.destroy, bootstyle='secondary').pack(side="right", padx=10)
+        
         self.load_data()
 
     def load_data(self):
@@ -69,60 +74,21 @@ class HistoryWindow(tk.Toplevel):
             conn.close()
             for ts, voltage, turbidity, status in rows:
                 status_key = (status or "").replace(" ", "_").lower()
-                status_tag = ""
-                if "cất" in status_key: status_tag = 'distilled'
-                elif "trong" in status_key: status_tag = 'clear'
-                elif "hơi_đục" in status_key: status_tag = 'slight'
-                elif "đục" in status_key and "rất" not in status_key: status_tag = 'cloudy'
-                elif "rất_đục" in status_key or "rất" in status_key: status_tag = 'very_cloudy'
+                
+                # Sử dụng bootstyle tags cho Treeview
+                status_tag = "default"
+                if "cất" in status_key: status_tag = 'success'
+                elif "trong" in status_key: status_tag = 'info'
+                elif "hơi_đục" in status_key: status_tag = 'warning'
+                elif "đục" in status_key and "rất" not in status_key: status_tag = 'danger'
+                elif "rất_đục" in status_key or "rất" in status_key: status_tag = 'danger'
+                
                 self.tree.insert("", tk.END, values=(ts, round(voltage), round(turbidity, 2), status), tags=(status_tag,))
         except Exception as e:
             self.tree.insert("", tk.END, values=(f"Lỗi tải lịch sử: {e}", "", "", ""))
 
 
-# Lớp Widget Đồng hồ Gauge tùy chỉnh
-class GaugeWidget(tk.Canvas):
-    def __init__(self, master=None, width=200, height=120, label="", unit="", **kwargs):
-        super().__init__(master, width=width, height=height, borderwidth=0, highlightthickness=0, **kwargs)
-        self.width = width
-        self.height = height
-        self.label = label
-        self.unit = unit
-        self.value = 0
-        self.bg_color = "#1F2937"
-        self.fill_color = "#374151"
-        self.outline_color = "#4B5563"
-        self.needle_color = "#EF4444"
-        self.text_color = "#F9FAFB"
-        self.configure(bg=self.bg_color)
-        self.draw_gauge()
-
-    def draw_gauge(self):
-        self.delete("all")
-        self.create_arc(10, 10, self.width - 10, self.height * 2 - 20, start=0, extent=180, style=tk.ARC, outline=self.outline_color, width=4, fill=self.fill_color)
-        self.value_arc = self.create_arc(25, 25, self.width - 25, self.height * 2 - 45, start=180, extent=0, style=tk.ARC, outline=self.get_color_for_value(0), width=16)
-        self.create_text(self.width / 2, self.height - 45, text=self.label, font=("Arial", 12), fill=self.text_color)
-        self.value_text = self.create_text(self.width / 2, self.height - 20, text=f"0.0 {self.unit}", font=("Arial", 16, "bold"), fill=self.text_color)
-        self.needle = self.create_line(self.width / 2, self.height-12, self.width / 2, 30, fill=self.needle_color, width=3)
-        self.set_value(self.value)
-
-    def set_value(self, value):
-        # Thang đo 0-1000 NTU
-        self.value = max(0, min(1000, value))
-        self.itemconfig(self.value_text, text=f"{self.value:.1f} {self.unit}")
-        angle = (self.value / 1000.0) * 180.0
-        self.itemconfig(self.value_arc, extent=-angle, outline=self.get_color_for_value(self.value))
-        angle_rad = math.radians(180 - angle)
-        center_x, center_y = self.width / 2, self.height - 12
-        end_x = center_x + (self.height - 35) * math.cos(angle_rad)
-        end_y = center_y - (self.height - 35) * math.sin(angle_rad)
-        self.coords(self.needle, center_x, center_y, end_x, end_y)
-
-    def get_color_for_value(self, value):
-        if value <= 10: return "#38BDF8"    # Nước trong
-        elif value <= 50: return "#EAB308"  # Nước hơi đục
-        elif value <= 100: return "#F97316" # Nước đục
-        else: return "#EF4444"              # Nước rất đục
+# Đã XÓA lớp GaugeWidget tùy chỉnh theo yêu cầu
 
 # Giao diện chính
 class TurbiditySensorGUI:
@@ -132,12 +98,6 @@ class TurbiditySensorGUI:
         self.root.geometry("850x700")
         self.root.resizable(True, True)
 
-        self.colors = {
-            "bg_main": "#111827", "bg_card": "#1F2937",
-            "text": "#D1D5DB", "text_header": "#F9FAFB", "accent": "#38BDF8",
-        }
-        self.root.configure(bg=self.colors["bg_main"])
-        
         self.serial_connection = None
         self.is_running = False
         self.turbidity_data = []
@@ -170,7 +130,7 @@ class TurbiditySensorGUI:
         self.RATE_ALERT_COOLDOWN_SEC = 60     # tránh spam cảnh báo ngắn hạn
         self.last_rate_alert_at = 0.0
 
-        self.create_styles()
+        # Xóa create_styles()
         self.create_widgets()
         # Đường dẫn file .env để lưu cài đặt Telegram (không commit)
         self.config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -182,93 +142,120 @@ class TurbiditySensorGUI:
         self.init_db()
         self.periodic_log()
 
-    def create_styles(self):
-        style = ttk.Style(self.root)
-        style.theme_use('clam')
-        style.configure('.', background=self.colors["bg_main"], foreground=self.colors["text"], borderwidth=0, focuscolor=self.colors["bg_main"])
-        style.configure('TFrame', background=self.colors["bg_main"])
-        style.configure('Card.TFrame', background=self.colors["bg_card"])
-        style.configure('TButton', font=('Arial', 10, 'bold'), padding=10, background="#374151", foreground=self.colors["text_header"], borderwidth=0)
-        style.map('TButton', background=[('active', self.colors["accent"])])
-        style.configure("Treeview", rowheight=25, fieldbackground=self.colors["bg_card"], background=self.colors["bg_card"], foreground=self.colors["text"])
-        style.configure("Treeview.Heading", font=('Arial', 10, 'bold'), background="#374151", foreground=self.colors["text_header"])
-        style.map("Treeview.Heading", background=[('active', self.colors["accent"])])
+    # Đã XÓA hàm create_styles(self)
 
     def create_widgets(self):
-        main_frame = ttk.Frame(self.root, padding=20)
+        # Sử dụng b.Frame
+        main_frame = b.Frame(self.root, padding=20)
         main_frame.pack(fill="both", expand=True)
         main_frame.columnconfigure(0, weight=1)
-        header_label = tk.Label(main_frame, text="Dashboard Giám sát Độ đục Nước", bg=self.colors["bg_main"], fg=self.colors["text_header"], font=("Arial", 28, "bold"))
+        
+        # Sử dụng b.Label
+        header_label = b.Label(main_frame, text="Dashboard Giám sát Độ đục Nước", font=("Arial", 28, "bold"))
         header_label.grid(row=0, column=0, pady=(0, 10))
-        status_controls_frame = ttk.Frame(main_frame)
+        
+        status_controls_frame = b.Frame(main_frame)
         status_controls_frame.grid(row=1, column=0, sticky="ew", pady=10)
         status_controls_frame.columnconfigure(0, weight=1)
         status_controls_frame.columnconfigure(1, weight=0)
-        self.status_label = tk.Label(status_controls_frame, text="Đang kết nối tới Arduino...", bg=self.colors["bg_main"], fg=self.colors["text"], font=("Arial", 11))
+        
+        # Sử dụng b.Label
+        self.status_label = b.Label(status_controls_frame, text="Đang kết nối tới Arduino...", font=("Arial", 11))
         self.status_label.grid(row=0, column=0, sticky="w", padx=10)
-        button_frame = ttk.Frame(status_controls_frame)
+        
+        button_frame = b.Frame(status_controls_frame)
         button_frame.grid(row=0, column=1, sticky="e")
-        self.start_button = ttk.Button(button_frame, text="Bắt đầu", command=self.start_monitoring)
+        
+        # Sử dụng b.Button với bootstyle='primary'
+        self.start_button = b.Button(button_frame, text="Bắt đầu", command=self.start_monitoring, bootstyle='primary')
         self.start_button.pack(side="left", padx=5)
-        self.stop_button = ttk.Button(button_frame, text="Dừng lại", command=self.stop_monitoring, state=tk.DISABLED)
+        self.stop_button = b.Button(button_frame, text="Dừng lại", command=self.stop_monitoring, state=tk.DISABLED, bootstyle='primary')
         self.stop_button.pack(side="left", padx=5)
-        self.connect_button = ttk.Button(button_frame, text="Kết nối lại", command=self.connect_to_arduino)
+        self.connect_button = b.Button(button_frame, text="Kết nối lại", command=self.connect_to_arduino, bootstyle='primary')
         self.connect_button.pack(side="left", padx=5)
-        self.history_button = ttk.Button(button_frame, text="Lịch sử đo", command=self.open_history_window)
+        self.history_button = b.Button(button_frame, text="Lịch sử đo", command=self.open_history_window, bootstyle='primary')
         self.history_button.pack(side="left", padx=5)
-    # Đã gỡ bỏ các nút cài đặt và gửi thử Telegram theo yêu cầu
-        gauge_frame = ttk.Frame(main_frame)
+
+        gauge_frame = b.Frame(main_frame)
         gauge_frame.grid(row=2, column=0, pady=20)
-        self.turbidity_gauge = GaugeWidget(gauge_frame, width=300, height=180, label="Độ đục", unit="NTU", bg=self.colors["bg_card"])
+        
+        # Ttkbootstrap Meter widget thay thế GaugeWidget tùy chỉnh
+        self.turbidity_gauge = b.Meter(
+            gauge_frame,
+            metersize=250,
+            amounttotal=1000,
+            amountused=0,
+            subtext="NTU",
+            bootstyle='info',
+            interactive=False,
+            stripethickness=10
+        )
         self.turbidity_gauge.pack()
-        cards_frame = ttk.Frame(main_frame)
+
+        cards_frame = b.Frame(main_frame)
         cards_frame.grid(row=3, column=0, sticky="ew", pady=10)
         cards_frame.columnconfigure([0, 1], weight=1)
-        status_card = ttk.Frame(cards_frame, style='Card.TFrame', padding=15)
+
+        # Card Trạng thái Nước với bố cục cải tiến
+        status_card = b.Frame(cards_frame, bootstyle='secondary', padding=20)
         status_card.grid(row=0, column=0, sticky="nsew", padx=10)
-        status_card.pack_propagate(False)
-        tk.Label(status_card, text="🌊 Trạng thái Nước", font=("Arial", 16, "bold"), bg=self.colors["bg_card"], fg=self.colors["text_header"]).pack()
-        # Hàng hiển thị trạng thái gồm chấm chỉ báo và nhãn trạng thái
-        status_row = ttk.Frame(status_card, style='Card.TFrame')
+        
+        b.Label(status_card, text="🌊 Trạng thái Nước", font=("Arial", 16, "bold")).pack(pady=(0, 10))
+        
+        # Hàng hiển thị trạng thái
+        status_row = b.Frame(status_card, bootstyle='secondary')
         status_row.pack(pady=10)
-        # Chỉ báo nhẹ (dot) - mặc định màu xám trung tính
-        self.status_indicator = tk.Canvas(status_row, width=18, height=18, bg=self.colors["bg_card"], highlightthickness=0)
-        self.status_indicator_circle = self.status_indicator.create_oval(3, 3, 15, 15, fill="#6B7280", outline="#111827")
+        
+        # Chỉ báo màu với nền khớp theme darkly
+        self.status_indicator = tk.Canvas(status_row, width=18, height=18, bg="#2b3e50", highlightthickness=0)
+        self.status_indicator_circle = self.status_indicator.create_oval(3, 3, 15, 15, fill="#6B7280", outline="#2b3e50")
         self.status_indicator.pack(side="left", padx=(0, 8))
-        # Nhãn trạng thái
-        self.water_status_label = tk.Label(status_row, text="--", font=("Arial", 24, "bold"), bg=self.colors["bg_card"], fg=self.colors["accent"])
+        
+        # Nhãn trạng thái với font lớn
+        self.water_status_label = b.Label(status_row, text="--", font=("Arial", 24, "bold"))
         self.water_status_label.pack(side="left")
-        status_card.config(height=120)
-        volt_card = ttk.Frame(cards_frame, style='Card.TFrame', padding=15)
+
+        # Card Điện áp với bố cục cải tiến
+        volt_card = b.Frame(cards_frame, bootstyle='secondary', padding=20)
         volt_card.grid(row=0, column=1, sticky="nsew", padx=10)
-        volt_card.pack_propagate(False)
-        tk.Label(volt_card, text="⚡ Điện áp Cảm biến", font=("Arial", 16, "bold"), bg=self.colors["bg_card"], fg=self.colors["text_header"]).pack()
-        self.voltage_label = tk.Label(volt_card, text="-- V", font=("Arial", 24, "bold"), bg=self.colors["bg_card"], fg=self.colors["accent"])
+        
+        b.Label(volt_card, text="⚡ Điện áp Cảm biến", font=("Arial", 16, "bold")).pack(pady=(0, 10))
+        
+        # Nhãn điện áp với font lớn
+        self.voltage_label = b.Label(volt_card, text="-- V", font=("Arial", 24, "bold"))
         self.voltage_label.pack(pady=10)
-        volt_card.config(height=120)
-        self.graph_frame = ttk.Frame(main_frame, style='Card.TFrame')
+        
+        # Card Biểu đồ
+        self.graph_frame = b.Frame(main_frame, bootstyle='secondary', padding=20)
         self.graph_frame.grid(row=4, column=0, pady=20, padx=10, sticky="nsew")
         main_frame.rowconfigure(4, weight=1)
-        self.figure = Figure(figsize=(6, 4), dpi=100, facecolor=self.colors["bg_card"])
+
+        # Cấu hình biểu đồ với màu sắc phù hợp cho theme darkly
+        self.figure = Figure(figsize=(6, 4), dpi=100, facecolor="#2b3e50")
         self.ax = self.figure.add_subplot(111)
-        self.ax.set_title("Lịch sử Độ đục (50 điểm gần nhất)", color=self.colors["text_header"])
-        self.ax.set_xlabel("Thời gian", color=self.colors["text"])
-        self.ax.set_ylabel("NTU", color=self.colors["text"])
-        self.ax.tick_params(axis='x', colors=self.colors["text"])
-        self.ax.tick_params(axis='y', colors=self.colors["text"])
-        self.ax.grid(True, linestyle='--', alpha=0.2, color=self.colors["text"])
-        self.ax.set_facecolor("#374151")
-        for spine in self.ax.spines.values(): spine.set_edgecolor(self.colors["text"])
-        self.line, = self.ax.plot([], [], color=self.colors["accent"], marker='o', markersize=3, linewidth=2)
-        # Đường xu hướng (Bitcoin-like): nét đứt, màu amber
-        self.trend_line, = self.ax.plot([], [], color="#F59E0B", linestyle='--', linewidth=2, alpha=0.9)
+        self.ax.set_title("Lịch sử Độ đục (50 điểm gần nhất)", color="#ffffff")
+        self.ax.set_xlabel("Thời gian", color="#ffffff")
+        self.ax.set_ylabel("NTU", color="#ffffff")
+        self.ax.tick_params(axis='x', colors="#ffffff")
+        self.ax.tick_params(axis='y', colors="#ffffff")
+        self.ax.grid(True, linestyle='--', alpha=0.3, color="#52667a")
+        self.ax.set_facecolor("#1e2d3d")
+        for spine in self.ax.spines.values(): 
+            spine.set_edgecolor("#52667a")
+        
+        # Lưu màu primary và warning từ theme để dùng cho biểu đồ
+        self.line, = self.ax.plot([], [], color='#3b8fd6', marker='o', markersize=3, linewidth=2)
+        self.trend_line, = self.ax.plot([], [], color='#f39c12', linestyle='--', linewidth=2, alpha=0.9)
+        
         self.figure.tight_layout()
         self.canvas_graph = FigureCanvasTkAgg(self.figure, master=self.graph_frame)
         self.canvas_graph.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+        # =======================================
 
     def open_history_window(self):
         if self.history_win is None or not self.history_win.winfo_exists():
-            self.history_win = HistoryWindow(self.root, colors=self.colors)
+            # Xóa tham số 'colors'
+            self.history_win = HistoryWindow(self.root)
             self.history_win.transient(self.root)
         else:
             self.history_win.lift() 
@@ -393,14 +380,27 @@ class TurbiditySensorGUI:
     def update_gui(self, voltage, turbidity):
         def _update():
             self.voltage_label.config(text=f"{(voltage / 1000.0):.3f} V")
-            status, color = self.get_water_status(turbidity)
-            self.water_status_label.config(text=status, fg=color)
-            # Cập nhật màu chấm chỉ báo theo trạng thái
-            try:
-                self.status_indicator.itemconfig(self.status_indicator_circle, fill=color)
-            except Exception:
-                pass
-            self.turbidity_gauge.set_value(turbidity)
+            
+            # Lấy trạng thái và bootstyle tương ứng
+            status, status_bootstyle = self.get_water_status_bootstyle(turbidity)
+            
+            # Cập nhật nhãn trạng thái với màu tương ứng
+            self.water_status_label.config(text=status, bootstyle=status_bootstyle)
+            
+            # Lấy màu hex từ bootstyle để cập nhật chỉ báo canvas
+            color_map = {
+                'success': '#00bc8c',
+                'info': '#3498db',
+                'warning': '#f39c12',
+                'danger': '#e74c3c'
+            }
+            indicator_color = color_map.get(status_bootstyle, '#6B7280')
+            
+            # Cập nhật màu chấm chỉ báo
+            self.status_indicator.itemconfig(self.status_indicator_circle, fill=indicator_color)
+            
+            # Cập nhật Meter với giá trị và màu tương ứng
+            self.turbidity_gauge.configure(amountused=turbidity, bootstyle=status_bootstyle)
             
             # Lưu mẫu cho phân tích xu hướng
             self.recent_samples.append((time.time(), turbidity))
@@ -543,14 +543,12 @@ class TurbiditySensorGUI:
             current_time = time.time()
             if (current_time - self.last_log_time) >= self.log_interval:
                 # print(f"Logging (periodic) do đã qua 1 giờ: {self.last_turbidity:.2f} NTU") # Đã tắt debug
-                status, _ = self.get_water_status(self.last_turbidity)
+                status, _ = self.get_water_status_bootstyle(self.last_turbidity)
                 self.log_to_db(self.last_voltage, self.last_turbidity, status)
                 self.last_log_time = current_time
 
         if self.root.winfo_exists():
             self.root.after(10000, self.periodic_log) # Kiểm tra mỗi 10 giây
-
-    # Đã gỡ bỏ chức năng gửi thử Telegram theo yêu cầu
 
     # ====== Cấu hình Telegram (.env) ======
     def load_env_settings(self):
@@ -584,17 +582,17 @@ class TurbiditySensorGUI:
         if chat:
             os.environ['TELEGRAM_CHAT_ID'] = chat
 
-    # Đã gỡ bỏ chức năng lưu .env qua GUI theo yêu cầu
+    # Hàm tiện ích mới: trả về (status_text, bootstyle_name)
+    def get_water_status_bootstyle(self, turbidity):
+        if turbidity < 1: return "Nước cất", "success"
+        elif turbidity <= 10: return "Nước trong", "info"
+        elif turbidity <= 50: return "Nước hơi đục", "warning"
+        elif turbidity <= 100: return "Nước đục", "danger"
+        else: return "Nước rất đục", "danger"
 
-    # Đã gỡ bỏ cửa sổ cài đặt Telegram theo yêu cầu
-
-    def get_water_status(self, turbidity):
-        if turbidity < 1: return "Nước cất", "#22C55E"
-        elif turbidity <= 10: return "Nước trong", "#38BDF8"
-        elif turbidity <= 50: return "Nước hơi đục", "#EAB308"
-        elif turbidity <= 100: return "Nước đục", "#F97316"
-        else: return "Nước rất đục", "#EF4444"
-
+    # Hàm get_water_status cũ (không còn dùng)
+    # def get_water_status(self, turbidity): ...
+        
     def init_db(self):
         try:
             conn = sqlite3.connect(self.DB_PATH)
@@ -703,7 +701,8 @@ class TurbiditySensorGUI:
         self.root.destroy()
 
 def main():
-    root = tk.Tk()
+    # Sử dụng b.Window với themename='darkly'
+    root = b.Window(themename='darkly')
     app = TurbiditySensorGUI(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing) # Xử lý khi nhấn nút X
     root.mainloop()
