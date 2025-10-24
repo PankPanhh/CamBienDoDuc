@@ -41,7 +41,7 @@ class HistoryWindow(tk.Toplevel):
         self.tree.column("turbidity", width=100, anchor=tk.CENTER)
         self.tree.column("status", width=120, anchor=tk.W)
         scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscroll=scrollbar.set)
+        self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
         frame.rowconfigure(0, weight=1)
@@ -160,6 +160,15 @@ class TurbiditySensorGUI:
         self.TELEGRAM_MIN_INTERVAL_SEC = 60  # giữ cooldown chung; trạng thái thay đổi sẽ bỏ qua
         self.TREND_WINDOW_SEC = 60
         self.TREND_ALERT_SLOPE = 30.0  # NTU per minute
+        self.TREND_LINE_WINDOW_SEC = 300  # cửa sổ hiển thị đường xu hướng trên biểu đồ
+        self.TREND_ROLLING_WINDOW_SEC = 60  # cửa sổ lăn cho đường xu hướng (tạo gấp khúc)
+        # Cảnh báo tốc độ thay đổi ngắn hạn (1-2 phút)
+        self.RATE_WINDOW_SEC = 60             # cửa sổ 1 phút (có thể tăng 120s nếu cần)
+        self.RATE_ALERT_SLOPE = 20.0          # NTU/phút
+        self.RATE_MIN_DELTA = 10.0            # thay đổi tối thiểu trong cửa sổ
+        self.RATE_MIN_POINTS = 3              # tối thiểu số điểm trong cửa sổ
+        self.RATE_ALERT_COOLDOWN_SEC = 60     # tránh spam cảnh báo ngắn hạn
+        self.last_rate_alert_at = 0.0
 
         self.create_styles()
         self.create_widgets()
@@ -251,6 +260,8 @@ class TurbiditySensorGUI:
         self.ax.set_facecolor("#374151")
         for spine in self.ax.spines.values(): spine.set_edgecolor(self.colors["text"])
         self.line, = self.ax.plot([], [], color=self.colors["accent"], marker='o', markersize=3, linewidth=2)
+        # Đường xu hướng (Bitcoin-like): nét đứt, màu amber
+        self.trend_line, = self.ax.plot([], [], color="#F59E0B", linestyle='--', linewidth=2, alpha=0.9)
         self.figure.tight_layout()
         self.canvas_graph = FigureCanvasTkAgg(self.figure, master=self.graph_frame)
         self.canvas_graph.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
@@ -271,7 +282,17 @@ class TurbiditySensorGUI:
                     self.serial_connection = serial.Serial(port=port, baudrate=9600, timeout=1, write_timeout=1)
                     print(f"Opening port {port}...")
                     time.sleep(2) # Cho Arduino thời gian khởi động lại
-                    self.serial_connection.flushInput() # Xóa bộ đệm
+                    # Xóa bộ đệm input với API mới; fallback tương thích nếu cần
+                    try:
+                        reset_fn = getattr(self.serial_connection, "reset_input_buffer", None)
+                        if callable(reset_fn):
+                            reset_fn()
+                        else:
+                            flush_fn = getattr(self.serial_connection, "flushInput", None)
+                            if callable(flush_fn):
+                                flush_fn()
+                    except Exception:
+                        pass
                     print(f"Port {port} opened. Flushing input.")
                     self.status_label.config(text=f"Đã kết nối trên {port}")
                     print(f"Connected to Arduino on {port}")
@@ -384,6 +405,34 @@ class TurbiditySensorGUI:
             # Lưu mẫu cho phân tích xu hướng
             self.recent_samples.append((time.time(), turbidity))
 
+            # Cảnh báo tốc độ thay đổi ngắn hạn (1 phút): dự báo vấn đề trước khi vượt ngưỡng cao
+            try:
+                now_ts = time.time()
+                cutoff_short = now_ts - self.RATE_WINDOW_SEC
+                short_window = [s for s in self.recent_samples if s[0] >= cutoff_short]
+                if len(short_window) >= max(2, self.RATE_MIN_POINTS):
+                    t0s = short_window[0][0]
+                    ts2 = [(w[0] - t0s) / 60.0 for w in short_window]  # phút
+                    ys2 = [w[1] for w in short_window]
+                    mean_t2 = sum(ts2) / len(ts2)
+                    mean_y2 = sum(ys2) / len(ys2)
+                    denom2 = sum((t - mean_t2) ** 2 for t in ts2) or 1e-9
+                    slope2 = sum((t - mean_t2) * (y - mean_y2) for t, y in zip(ts2, ys2)) / denom2
+                    delta2 = ys2[-1] - ys2[0]
+                    dur2 = max(1e-6, ts2[-1] - ts2[0])
+                    if slope2 >= self.RATE_ALERT_SLOPE and delta2 >= self.RATE_MIN_DELTA:
+                        if (now_ts - self.last_rate_alert_at) >= self.RATE_ALERT_COOLDOWN_SEC:
+                            self.last_rate_alert_at = now_ts
+                            try:
+                                self.send_notification(
+                                    f"📈 Trend Warning: Water is getting cloudy fast! ~{slope2:.0f} NTU/min (Δ{delta2:.1f} NTU/{dur2:.1f} min)",
+                                    skip_cooldown=True,
+                                )
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
             # Gửi Telegram mỗi khi trạng thái thay đổi (không giới hạn tần suất)
             if not hasattr(self, 'last_status_sent'):
                 self.last_status_sent = None
@@ -421,6 +470,41 @@ class TurbiditySensorGUI:
                 self.timestamps = self.timestamps[-50:]
             
             self.line.set_data(range(len(self.turbidity_data)), self.turbidity_data)
+
+            # Vẽ overlay Xu hướng (gấp khúc) với hồi quy tuyến tính lăn (rolling)
+            try:
+                cutoff = time.time() - self.TREND_LINE_WINDOW_SEC
+                window = [s for s in self.recent_samples if s[0] >= cutoff]
+                if len(window) >= 2:
+                    t0 = window[0][0]
+                    ts = [(w[0] - t0) / 60.0 for w in window]  # phút
+                    ys = [w[1] for w in window]
+                    roll_min = max(0.1, self.TREND_ROLLING_WINDOW_SEC / 60.0)  # phút
+                    y_fit_series = []
+                    for i in range(len(ts)):
+                        # Chọn đoạn con trong (ts[i] - roll_min, ts[i])
+                        left_t = ts[i] - roll_min
+                        sub_t = [t for t in ts[: i + 1] if t >= left_t]
+                        sub_y = ys[len(ts[: i + 1]) - len(sub_t) : i + 1]
+                        if len(sub_t) >= 2:
+                            mt = sum(sub_t) / len(sub_t)
+                            my = sum(sub_y) / len(sub_y)
+                            den = sum((t - mt) ** 2 for t in sub_t) or 1e-9
+                            sl = sum((t - mt) * (y - my) for t, y in zip(sub_t, sub_y)) / den
+                            itc = my - sl * mt
+                            y_fit_series.append(sl * ts[i] + itc)
+                        else:
+                            # Fallback: dùng giá trị thực hoặc bản sao giá trị trước đó để nối mượt
+                            y_fit_series.append(y_fit_series[-1] if y_fit_series else ys[i])
+
+                    tail_n = min(len(window), len(self.turbidity_data))
+                    x_start = max(0, len(self.turbidity_data) - tail_n)
+                    x_idx = list(range(x_start, len(self.turbidity_data)))
+                    self.trend_line.set_data(x_idx, y_fit_series[-tail_n:])
+                else:
+                    self.trend_line.set_data([], [])
+            except Exception:
+                self.trend_line.set_data([], [])
             
             if len(self.turbidity_data) > 1:
                 tick_skip = max(1, len(self.turbidity_data) // 5)
