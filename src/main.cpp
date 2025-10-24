@@ -4,6 +4,7 @@
 
 // Pin definitions
 #define SENSOR_PIN A0
+#define ALERT_PIN 8
 #define LCD_ADDR 0x27
 #define LCD_COLS 16
 #define LCD_ROWS 2
@@ -49,6 +50,8 @@ float voltageToNTU(float voltage) {
 void setup() {
   // Initialize pins
   pinMode(SENSOR_PIN, INPUT);
+  pinMode(ALERT_PIN, OUTPUT);
+  digitalWrite(ALERT_PIN, LOW);
 
   // Initialize Serial
   Serial.begin(9600);
@@ -67,6 +70,18 @@ void setup() {
 }
 
 void loop() {
+  // Handle incoming serial commands from PC
+  if (Serial.available() > 0) {
+    char cmd = (char)Serial.read();
+    if (cmd == 'A') {
+      digitalWrite(ALERT_PIN, HIGH);
+      Serial.println("ACK:A");
+    } else if (cmd == 'S') {
+      digitalWrite(ALERT_PIN, LOW);
+      Serial.println("ACK:S");
+    }
+  }
+
   if (millis() - lastReading >= READING_INTERVAL) {
     // Read sensor voltage
     float voltage = readSensorVoltage(15, 5);

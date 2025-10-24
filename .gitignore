@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Local runtime files (do not commit secrets or data)
+.env
+turbidity.db

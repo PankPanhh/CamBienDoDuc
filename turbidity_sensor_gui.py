@@ -1,7 +1,6 @@
 import tkinter as tk
 from tkinter import ttk
 import serial
-import json
 import time
 import os
 import threading
@@ -10,6 +9,16 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import math
 import re
+import sqlite3
+from collections import deque
+from urllib.parse import urlencode
+import urllib.request
+import ssl
+try:
+    import certifi
+    HAS_CERTIFI = True
+except Exception:
+    HAS_CERTIFI = False
 
 # Lớp Cửa sổ Lịch sử (Không thay đổi)
 class HistoryWindow(tk.Toplevel):
@@ -52,26 +61,23 @@ class HistoryWindow(tk.Toplevel):
         for item in self.tree.get_children():
             self.tree.delete(item)
         try:
-            with open("turbidity_log.json", "r", encoding='utf-8') as f:
-                logs = json.load(f)
-            for record in reversed(logs):
-                status_key = record.get("status", "").replace(" ", "_").lower()
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "turbidity.db")
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT ts, voltage, turbidity, status FROM readings ORDER BY id DESC LIMIT 500")
+            rows = cur.fetchall()
+            conn.close()
+            for ts, voltage, turbidity, status in rows:
+                status_key = (status or "").replace(" ", "_").lower()
                 status_tag = ""
                 if "cất" in status_key: status_tag = 'distilled'
                 elif "trong" in status_key: status_tag = 'clear'
                 elif "hơi_đục" in status_key: status_tag = 'slight'
-                elif "đục" in status_key: status_tag = 'cloudy'
-                elif "rất_đục" in status_key: status_tag = 'very_cloudy'
-                self.tree.insert("", tk.END, values=(
-                    record.get("timestamp", ""),
-                    record.get("voltage", ""),
-                    record.get("turbidity", ""),
-                    record.get("status", "")
-                ), tags=(status_tag,))
-        except FileNotFoundError:
-            self.tree.insert("", tk.END, values=("Không tìm thấy file log", "", "", ""))
-        except json.JSONDecodeError:
-            self.tree.insert("", tk.END, values=("File log bị lỗi hoặc trống", "", "", ""))
+                elif "đục" in status_key and "rất" not in status_key: status_tag = 'cloudy'
+                elif "rất_đục" in status_key or "rất" in status_key: status_tag = 'very_cloudy'
+                self.tree.insert("", tk.END, values=(ts, round(voltage), round(turbidity, 2), status), tags=(status_tag,))
+        except Exception as e:
+            self.tree.insert("", tk.END, values=(f"Lỗi tải lịch sử: {e}", "", "", ""))
 
 
 # Lớp Widget Đồng hồ Gauge tùy chỉnh
@@ -144,10 +150,27 @@ class TurbiditySensorGUI:
         self.last_voltage = None
 
         self.current_alert_level = 0
+        self.recent_samples = deque(maxlen=120)  # store last ~2 minutes assuming ~1s sample
+        self.last_command_sent_at = 0
+        self.last_command_type = None
+        self.last_notify_at = 0
+
+        # Settings
+        self.DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "turbidity.db")
+        self.TELEGRAM_MIN_INTERVAL_SEC = 60  # giữ cooldown chung; trạng thái thay đổi sẽ bỏ qua
+        self.TREND_WINDOW_SEC = 60
+        self.TREND_ALERT_SLOPE = 30.0  # NTU per minute
 
         self.create_styles()
         self.create_widgets()
+        # Đường dẫn file .env để lưu cài đặt Telegram (không commit)
+        self.config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        self.telegram_token = None
+        self.telegram_chat_id = None
+        self.load_env_settings()
+
         self.connect_to_arduino()
+        self.init_db()
         self.periodic_log()
 
     def create_styles(self):
@@ -184,6 +207,7 @@ class TurbiditySensorGUI:
         self.connect_button.pack(side="left", padx=5)
         self.history_button = ttk.Button(button_frame, text="Lịch sử đo", command=self.open_history_window)
         self.history_button.pack(side="left", padx=5)
+    # Đã gỡ bỏ các nút cài đặt và gửi thử Telegram theo yêu cầu
         gauge_frame = ttk.Frame(main_frame)
         gauge_frame.grid(row=2, column=0, pady=20)
         self.turbidity_gauge = GaugeWidget(gauge_frame, width=300, height=180, label="Độ đục", unit="NTU", bg=self.colors["bg_card"])
@@ -341,7 +365,7 @@ class TurbiditySensorGUI:
         if volt_unit and volt_unit.lower() == 'v':
             voltage_mV = volt_val * 1000.0
         elif not volt_unit and abs(volt_val) < 100: # Giả định nếu số quá nhỏ (<100) thì đó là Volt
-             voltage_mV = volt_val * 1000.0
+            voltage_mV = volt_val * 1000.0
         
         return float(voltage_mV), float(turbidity)
 
@@ -357,6 +381,19 @@ class TurbiditySensorGUI:
                 pass
             self.turbidity_gauge.set_value(turbidity)
             
+            # Lưu mẫu cho phân tích xu hướng
+            self.recent_samples.append((time.time(), turbidity))
+
+            # Gửi Telegram mỗi khi trạng thái thay đổi (không giới hạn tần suất)
+            if not hasattr(self, 'last_status_sent'):
+                self.last_status_sent = None
+            if status != self.last_status_sent:
+                try:
+                    self.send_notification(f"Trạng thái thay đổi: {status} — {turbidity:.2f} NTU", skip_cooldown=True)
+                except Exception:
+                    pass
+                self.last_status_sent = status
+
             # Logic Cảnh báo Đa cấp
             new_alert_level = 0
             if turbidity > 100: new_alert_level = 3
@@ -366,9 +403,15 @@ class TurbiditySensorGUI:
             if new_alert_level > self.current_alert_level:
                 # Tắt tất cả popup: không hiện thông báo ở mọi mức cảnh báo
                 self.current_alert_level = new_alert_level
+                # Gửi lệnh tới Arduino khi vượt mức rất đục
+                if new_alert_level >= 3:
+                    self.send_serial_command('A')
+                    self.send_notification(f"Cảnh báo: Độ đục rất cao ({turbidity:.2f} NTU)")
             elif new_alert_level == 0 and self.current_alert_level > 0:
                 self.current_alert_level = 0
                 print("Trạng thái cảnh báo đã reset (nước trong trở lại).")
+                # Có thể gửi lệnh tắt nếu muốn
+                self.send_serial_command('S')
 
             # Cập nhật Biểu đồ
             self.turbidity_data.append(turbidity)
@@ -394,10 +437,18 @@ class TurbiditySensorGUI:
 
             # Ghi log mỗi lần cập nhật để đồng bộ thời gian thực với app mobile
             current_time = time.time()
-            self.log_to_json(voltage, turbidity, status)
+            self.log_to_db(voltage, turbidity, status)
             self.last_turbidity = turbidity
             self.last_voltage = voltage
             self.last_log_time = current_time
+
+            # Phát hiện xu hướng tăng nhanh
+            try:
+                if self.is_trend_rising():
+                    self.send_notification(f"Cảnh báo xu hướng: Độ đục đang tăng nhanh (>{self.TREND_ALERT_SLOPE:.0f} NTU/phút)")
+                    self.send_serial_command('A')
+            except Exception:
+                pass
 
         # Đảm bảo GUI cập nhật trên luồng chính
         if self.root.winfo_exists():
@@ -409,11 +460,49 @@ class TurbiditySensorGUI:
             if (current_time - self.last_log_time) >= self.log_interval:
                 # print(f"Logging (periodic) do đã qua 1 giờ: {self.last_turbidity:.2f} NTU") # Đã tắt debug
                 status, _ = self.get_water_status(self.last_turbidity)
-                self.log_to_json(self.last_voltage, self.last_turbidity, status)
+                self.log_to_db(self.last_voltage, self.last_turbidity, status)
                 self.last_log_time = current_time
 
         if self.root.winfo_exists():
             self.root.after(10000, self.periodic_log) # Kiểm tra mỗi 10 giây
+
+    # Đã gỡ bỏ chức năng gửi thử Telegram theo yêu cầu
+
+    # ====== Cấu hình Telegram (.env) ======
+    def load_env_settings(self):
+        # Ưu tiên đọc từ .env; nếu không có thì dùng os.environ
+        token, chat = None, None
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        if '=' in line:
+                            k, v = line.split('=', 1)
+                            k = k.strip()
+                            v = v.strip().strip('"').strip("'")
+                            if k == 'TELEGRAM_BOT_TOKEN':
+                                token = v
+                            elif k == 'TELEGRAM_CHAT_ID':
+                                chat = v
+            except Exception as e:
+                print(f"Lỗi đọc .env: {e}")
+        # Fallback sang biến môi trường nếu .env không có
+        token = token or os.environ.get('TELEGRAM_BOT_TOKEN')
+        chat = chat or os.environ.get('TELEGRAM_CHAT_ID')
+        self.telegram_token = token
+        self.telegram_chat_id = chat
+        # Đồng bộ lại vào os.environ cho phiên hiện tại
+        if token:
+            os.environ['TELEGRAM_BOT_TOKEN'] = token
+        if chat:
+            os.environ['TELEGRAM_CHAT_ID'] = chat
+
+    # Đã gỡ bỏ chức năng lưu .env qua GUI theo yêu cầu
+
+    # Đã gỡ bỏ cửa sổ cài đặt Telegram theo yêu cầu
 
     def get_water_status(self, turbidity):
         if turbidity < 1: return "Nước cất", "#22C55E"
@@ -422,31 +511,104 @@ class TurbiditySensorGUI:
         elif turbidity <= 100: return "Nước đục", "#F97316"
         else: return "Nước rất đục", "#EF4444"
 
-    def log_to_json(self, voltage, turbidity, status):
-        # Ghi atomically vào file log nằm cùng thư mục script, tránh lỗi đọc giữa chừng
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        data = {"timestamp": timestamp, "voltage": round(voltage, 0), "turbidity": round(turbidity, 2), "status": status, "source": "Arduino Uno"}
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        file_path = os.path.join(base_dir, "turbidity_log.json")
-        tmp_path = file_path + ".tmp"
+    def init_db(self):
         try:
-            logs = []
-            if os.path.exists(file_path):
-                try:
-                    with open(file_path, "r", encoding='utf-8') as f:
-                        logs = json.load(f)
-                except json.JSONDecodeError:
-                    # Nếu file đang được ghi dở, bỏ qua và tạo log mới
-                    logs = []
-            logs.append(data)
-            # Ghi ra file tạm và thay thế atomically
-            with open(tmp_path, "w", encoding='utf-8') as f:
-                json.dump(logs[-1000:], f, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, file_path)
+            conn = sqlite3.connect(self.DB_PATH)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS readings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    voltage REAL,
+                    turbidity REAL,
+                    status TEXT,
+                    source TEXT
+                )
+                """
+            )
+            conn.commit()
+            conn.close()
         except Exception as e:
-            print(f"Lỗi ghi JSON: {e}") # Giữ lại thông báo lỗi này
+            print(f"Lỗi khởi tạo DB: {e}")
+
+    def log_to_db(self, voltage, turbidity, status):
+        try:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conn = sqlite3.connect(self.DB_PATH)
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO readings (ts, voltage, turbidity, status, source) VALUES (?, ?, ?, ?, ?)",
+                (ts, round(voltage, 0), round(turbidity, 2), status, "Arduino Uno")
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Lỗi ghi DB: {e}")
+
+    def is_trend_rising(self):
+        # Compute slope over last TREND_WINDOW_SEC seconds
+        if len(self.recent_samples) < 2:
+            return False
+        cutoff = time.time() - self.TREND_WINDOW_SEC
+        window = [s for s in self.recent_samples if s[0] >= cutoff]
+        if len(window) < 2:
+            return False
+        ntu_start = window[0][1]
+        ntu_end = window[-1][1]
+        dt_min = max(1e-6, (window[-1][0] - window[0][0]) / 60.0)
+        slope = (ntu_end - ntu_start) / dt_min
+        return slope >= self.TREND_ALERT_SLOPE
+
+    def send_serial_command(self, cmd: str):
+        # Avoid spamming; send at most once per 10s per type
+        now = time.time()
+        if self.serial_connection and self.serial_connection.is_open:
+            if self.last_command_type != cmd or (now - self.last_command_sent_at) >= 10:
+                try:
+                    self.serial_connection.write(cmd.encode('utf-8'))
+                    self.last_command_type = cmd
+                    self.last_command_sent_at = now
+                except Exception as e:
+                    print(f"Lỗi gửi lệnh tới Arduino: {e}")
+
+    def send_notification(self, message: str, skip_cooldown: bool = False):
+        # Telegram via env vars TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+        now = time.time()
+        if not token or not chat_id:
+            return
+        if (not skip_cooldown) and (now - self.last_notify_at) < self.TELEGRAM_MIN_INTERVAL_SEC:
+            return
+        try:
+            api_url = f"https://api.telegram.org/bot{token}/sendMessage"
+            params = urlencode({
+                "chat_id": chat_id,
+                "text": message
+            }).encode("utf-8")
+            req = urllib.request.Request(api_url, data=params)
+            # SSL context: dùng certifi nếu có; có thể bật bỏ qua verify qua env var (không khuyến nghị)
+            insecure_skip = os.environ.get("TELEGRAM_INSECURE_SKIP_VERIFY") == "1"
+            if insecure_skip:
+                print("[Cảnh báo] Đang bỏ qua xác thực SSL (TELEGRAM_INSECURE_SKIP_VERIFY=1). Chỉ sử dụng tạm thời để kiểm tra.")
+                context = ssl._create_unverified_context()
+            else:
+                context = ssl.create_default_context()
+                if HAS_CERTIFI:
+                    try:
+                        context.load_verify_locations(certifi.where())
+                    except Exception:
+                        pass
+
+            with urllib.request.urlopen(req, context=context, timeout=10) as resp:
+                _ = resp.read()
+            self.last_notify_at = now
+        except Exception as e:
+            err = str(e)
+            print(f"Gửi Telegram thất bại: {e}")
+            if "CERTIFICATE_VERIFY_FAILED" in err.upper():
+                print("\nGợi ý khắc phục SSL:\n- Nếu đang ở mạng công ty/proxy, hãy cài chứng chỉ CA nội bộ vào Windows Trusted Root.\n- Hoặc cài certifi: pip install certifi (ứng dụng sẽ tự dùng certifi nếu có).\n- Hoặc đặt biến môi trường SSL_CERT_FILE hoặc REQUESTS_CA_BUNDLE trỏ tới file CA bundle.\n- Chỉ để test tạm thời: set TELEGRAM_INSECURE_SKIP_VERIFY=1 (không khuyến nghị dùng lâu dài).\n")
 
     def on_closing(self):
         print("Closing application...")
