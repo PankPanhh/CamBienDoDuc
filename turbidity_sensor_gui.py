@@ -425,7 +425,7 @@ class TurbiditySensorGUI:
                             self.last_rate_alert_at = now_ts
                             try:
                                 self.send_notification(
-                                    f"📈 Trend Warning: Water is getting cloudy fast! ~{slope2:.0f} NTU/min (Δ{delta2:.1f} NTU/{dur2:.1f} min)",
+                                    f"📈 Cảnh báo xu hướng: Nước đang đục nhanh! ~{slope2:.0f} NTU/min (Δ{delta2:.1f} NTU/{dur2:.1f} min)",
                                     skip_cooldown=True,
                                 )
                             except Exception:
